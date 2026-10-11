@@ -1,0 +1,12 @@
+﻿services:
+  webapplication2:
+    image: webapplication2
+    build:
+      context: .
+      dockerfile: WebApplication2/Dockerfile
+
+  redis:
+    image: redis:7
+    container_name: redis
+    ports:
+      - "6379:6379"
