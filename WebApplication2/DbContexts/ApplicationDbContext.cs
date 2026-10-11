@@ -18,6 +18,8 @@ public class ApplicationDbContext : DbContext
         {
             entity.HasKey(e => e.Id);
             entity.Property(e => e.Data).HasColumnType("TEXT");
+            entity.Property(e => e.Status).HasConversion<string>();
+            entity.Property(e => e.Error).HasColumnType("TEXT");
         });
     }
 }

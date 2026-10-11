@@ -37,11 +37,7 @@ public class R2FileStorage : IFileStorage
             DisablePayloadSigning = true
         };
         var response = _s3Client.PutObjectAsync(request).GetAwaiter().GetResult();
-        if (response.HttpStatusCode == System.Net.HttpStatusCode.OK)
-        {
-            return key;
-        }
-        return null;
+        return response.HttpStatusCode == System.Net.HttpStatusCode.OK ? key : null;
     }
 
     public byte[] Read(string path)

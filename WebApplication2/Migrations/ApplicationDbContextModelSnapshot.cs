@@ -24,6 +24,13 @@ namespace WebApplication2.Migrations
                     b.Property<string>("Data")
                         .HasColumnType("TEXT");
 
+                    b.Property<string>("Error")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("Status")
+                        .IsRequired()
+                        .HasColumnType("TEXT");
+
                     b.HasKey("Id");
 
                     b.ToTable("Geometries");

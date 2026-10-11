@@ -7,4 +7,9 @@ public class Geometry
     /// GeoJson data.
     /// </summary>
     public string? Data { get; set; }
+    public CalculationStatus Status { get; set; } = CalculationStatus.Processing;
+    /// <summary>
+    /// Error message populated when <see cref="Status"/> is <see cref="CalculationStatus.Failed"/>.
+    /// </summary>
+    public string? Error { get; set; }
 }

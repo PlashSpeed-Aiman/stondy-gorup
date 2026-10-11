@@ -1,10 +1,13 @@
 using System.Text.Json;
 using ClosedXML.Excel;
+using Hangfire;
+using Microsoft.EntityFrameworkCore;
 using NetTopologySuite;
 using NetTopologySuite.Features;
 using NetTopologySuite.Geometries;
 using NetTopologySuite.IO.Converters;
 using WebApplication2.DbContexts;
+using WebApplication2.Entities;
 using WebApplication2.Services;
 using Geometry = WebApplication2.Entities.Geometry;
 
@@ -26,42 +29,92 @@ public class ExcelProcessingJob
         _logger = logger;
     }
 
+    [AutomaticRetry(Attempts = 0)]
     public async Task Process(string filePath)
     {
         _logger.LogInformation("Starting Excel processing for file: {FilePath}", filePath);
 
-        var fileBytes = _fileStorage.Read(filePath);
-
-        _logger.LogInformation(
-            "Loaded Excel file from storage. File: {FilePath}, Size: {FileSize} bytes",
-            filePath,
-            fileBytes.Length);
-
-        var coordinates = ExtractCoordinates(fileBytes);
-
-        if (coordinates.Count == 0)
+        try
         {
-            _logger.LogWarning("No latitude/longitude values found in file: {FilePath}", filePath);
-            return;
+            var fileBytes = _fileStorage.Read(filePath);
+
+            _logger.LogInformation(
+                "Loaded Excel file from storage. File: {FilePath}, Size: {FileSize} bytes",
+                filePath,
+                fileBytes.Length);
+
+            var coordinates = ExtractCoordinates(fileBytes);
+
+            if (coordinates.Count == 0)
+            {
+                throw new InvalidOperationException(
+                    $"No latitude/longitude values found in file: {filePath}");
+            }
+
+            var geoJson = BuildGeoJson(coordinates);
+
+            // simulate very long processing time
+            await Task.Delay(60000);
+
+            await MarkCompleted(filePath, geoJson);
+
+            _logger.LogInformation(
+                "Stored GeoJSON with {PointCount} points (id: {GeometryId}) for file: {FilePath}",
+                coordinates.Count,
+                filePath,
+                filePath);
+        }
+        catch (Exception exception)
+        {
+            _logger.LogError(exception, "Excel processing failed for file: {FilePath}", filePath);
+            await TryMarkFailed(filePath, exception.Message);
+            throw;
+        }
+    }
+
+    private async Task MarkCompleted(string filePath, string geoJson)
+    {
+        var geometry = await GetOrCreateGeometry(filePath);
+
+        geometry.Data = geoJson;
+        geometry.Status = CalculationStatus.Completed;
+        geometry.Error = null;
+
+        await _dbContext.SaveChangesAsync();
+    }
+
+    private async Task TryMarkFailed(string filePath, string error)
+    {
+        try
+        {
+            var geometry = await GetOrCreateGeometry(filePath);
+
+            geometry.Status = CalculationStatus.Failed;
+            geometry.Error = error;
+
+            await _dbContext.SaveChangesAsync();
+        }
+        catch (Exception exception)
+        {
+            // the original exception should still fail the job even if its cause cannot be recorded
+            _logger.LogError(
+                exception,
+                "Could not persist the failed status for file: {FilePath}",
+                filePath);
+        }
+    }
+
+    private async Task<Geometry> GetOrCreateGeometry(string filePath)
+    {
+        var geometry = await _dbContext.Geometries.FirstOrDefaultAsync(g => g.Id == filePath);
+
+        if (geometry is null)
+        {
+            geometry = new Geometry { Id = filePath };
+            _dbContext.Geometries.Add(geometry);
         }
 
-        var geoJson = BuildGeoJson(coordinates);
-
-        var geometry = new Geometry
-        {
-            Id = filePath,
-            Data = geoJson
-        };
-        // simulate very long processing time
-        await Task.Delay(60000);
-
-        await _dbContext.Geometries.AddAsync(geometry);
-        await _dbContext.SaveChangesAsync();
-        _logger.LogInformation(
-            "Stored GeoJSON with {PointCount} points (id: {GeometryId}) for file: {FilePath}",
-            coordinates.Count,
-            geometry.Id,
-            filePath);
+        return geometry;
     }
 
     private static List<(double Latitude, double Longitude)> ExtractCoordinates(byte[] fileBytes)

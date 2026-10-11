@@ -1,6 +1,7 @@
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using WebApplication2.DbContexts;
+using WebApplication2.Entities;
 
 namespace WebApplication2.Controllers;
 
@@ -15,7 +16,7 @@ public class CalculationResultController : ControllerBase
         _dbContext = dbContext;
     }
 
-    [HttpGet("{id}",  Name = "GetCalculationResult")]
+    [HttpGet("{id}", Name = "GetCalculationResult")]
     public async Task<IActionResult> Index(string id)
     {
         var geometry = await _dbContext.Geometries
@@ -24,18 +25,46 @@ public class CalculationResultController : ControllerBase
 
         if (geometry is null)
         {
-            // if not done yet, tell the client that the calculation is still processing
-            return Accepted(new { status = "processing" });
+            return NotFound(new { status = "notFound" });
         }
 
-        return Content(geometry.Data ?? string.Empty, "application/geo+json");
+        return geometry.Status switch
+        {
+            // if not done yet, tell the client that the calculation is still processing
+            CalculationStatus.Processing => Accepted(new { status = "processing" }),
+            // the calculation will never produce a result; hand the client the reason
+            CalculationStatus.Failed => UnprocessableEntity(new
+            {
+                status = "failed",
+                error = geometry.Error
+            }),
+            _ => Content(geometry.Data ?? string.Empty, "application/geo+json")
+        };
     }
 
     [HttpGet("{id}/status")]
     public async Task<IActionResult> Status(string id)
     {
-        var isDone = await _dbContext.Geometries.AnyAsync(g => g.Id == id);
+        var geometry = await _dbContext.Geometries
+            .AsNoTracking()
+            .FirstOrDefaultAsync(g => g.Id == id);
 
-        return Ok(new { status = isDone ? "completed" : "processing" });
+        if (geometry is null)
+        {
+            return NotFound(new { status = "notFound" });
+        }
+
+        var status = geometry.Status switch
+        {
+            CalculationStatus.Processing => "processing",
+            CalculationStatus.Failed => "failed",
+            _ => "completed"
+        };
+
+        return Ok(new
+        {
+            status,
+            error = geometry.Status == CalculationStatus.Failed ? geometry.Error : null
+        });
     }
 }
