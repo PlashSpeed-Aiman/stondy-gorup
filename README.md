@@ -180,3 +180,12 @@ This builds the API image and starts Redis. Provide the R2 settings to the `weba
 - EF Core + SQLite — result persistence, migrations
 - AWSSDK.S3 — Cloudflare R2 access
 - ClosedXML — Excel parsing; NetTopologySuite + GeoJSON4STJ — GeoJSON output
+
+## Suggested improvements
+
+Ideas to harden the current implementation. None are required for the API to work as documented above.
+
+1. **Make file I/O async and streaming.** `IFileStorage` currently exposes synchronous `Write(byte[])` / `Read(string)`, implemented in `R2FileStorage` with blocking `.GetAwaiter().GetResult()` calls, and `FileController.Upload` buffers the whole file in memory (`CopyTo` + `ToArray()`) before uploading. Changing the port to `WriteAsync(Stream, CancellationToken)` / `ReadAsync(string, CancellationToken)` and passing `file.OpenReadStream()` straight to R2 removes the sync-over-async blocking and the duplicate in-memory copies. ASP.NET Core form streams are seekable, so the S3 SDK can still determine the content length. No API contract change.
+2. **Run the R2 upload as a background job.** Today the request waits for the upload to finish before returning the resource ID. Enqueueing the upload with Hangfire makes the response constant-time, but it requires staging the file before responding (temp disk or database), a real job-state model (`queued` / `uploading` / `processing` / `completed` / `failed`), and failure reporting — because the current status is binary (a row exists or it doesn't), an upload failure would otherwise look like "still processing" forever.
+3. **Accept uploads via presigned URLs.** For large files, hand the client a presigned PUT URL so it uploads straight to R2 and then calls the API to enqueue processing. The API never touches the bytes (constant-time, no staging), at the cost of a two-step client flow.
+4. **Surface failures and clean up orphaned objects.** If processing finds no lat/lon columns, the ID reports `processing` indefinitely, and if `BackgroundJob.Enqueue` throws after a successful upload, the R2 object is orphaned (the port has no delete operation). A small job-state table plus a `DeleteAsync` on the port would let the API report failures and clean up.
