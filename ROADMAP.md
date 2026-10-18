@@ -276,6 +276,125 @@ Each failure stores an error message, just like `Geometry.Status = Failed` does 
 | 4 | Compare two runs → growth rate + remaining life | Matching records between datasets (match by `distance_m` ± tolerance), keeping old results instead of overwriting them |
 | 5 | Alert when ERF ≥ 1, audit log, user roles | Webhooks with retries, append-only logs, authentication and authorisation |
 
+## Testing plan
+
+This plan follows two books:
+
+- **Gerard Meszaros, *xUnit Test Patterns*:** gives names for the parts of a test, the kinds of test double, and "test smells".
+- **Roy Osherove, *The Art of Unit Testing*:** what a *unit of work* is, how to name tests, stubs vs mocks, and keeping unit and integration tests apart.
+
+### Key ideas (one line each)
+
+| Idea | From | What it means for us |
+|---|---|---|
+| **SUT** (system under test) | Meszaros | The one thing a test is about. Everything else is setup. |
+| **Four-phase test**: setup → exercise → verify → teardown | Meszaros | Write it as **Arrange / Act / Assert** blocks (Osherove's name for the same thing). Teardown is usually automatic. |
+| **Unit of work** | Osherove | A unit is not "one method". It's everything that runs from one entry point to one *exit point*. |
+| **Three exit points**: a return value, a state change, or a call to a third party | Osherove | Check return values and state directly. Only a call to a third party needs a mock. |
+| **Test doubles**: dummy, stub, spy, mock, fake | Meszaros | See the table below. Use the precise name, not just "mock". |
+| **Stub vs mock** | Osherove | A stub *feeds data in* and you never assert on it. A mock *checks what went out*. Use **at most one mock per test**. |
+| **Humble Object** | Meszaros | Move logic out of things that are hard to test (controllers, Hangfire jobs) into plain classes. The hard-to-test part becomes so thin it barely needs a test. |
+| **Fresh fixture** | Meszaros | Each test builds its own data. Tests that share mutable data fail at random. |
+| **Readable, maintainable, trustworthy** | Osherove | No `if`s or loops in tests. Don't assert on implementation details. A failing test should point at the bug. |
+| **Safe green zone** | Osherove | Keep unit tests (fast, always pass) in a different project from integration tests (slower, need setup). |
+
+**Naming** (Osherove): `UnitOfWork_Scenario_ExpectedBehaviour`, e.g. `CalculateErf_DefectDeeperThanLimit_ReturnsAtLeastOne`.
+
+### The test pyramid for this project
+
+```mermaid
+flowchart TB
+    E2E["End-to-end (a few)<br/>upload generated file → poll → dig list"]
+    INT["Integration (some)<br/>real API + real SQLite, fake storage and queue"]
+    UNIT["Unit (many)<br/>calculator · parser · matcher · job logic"]
+    E2E --- INT --- UNIT
+```
+
+### Design for testability first
+
+Tests need **seams**: places where a test can plug in a double. Two seams to add before writing tests:
+
+1. **Queue seam.** `FileController` calls the static `BackgroundJob.Enqueue(...)`, which a test can't replace. Inject Hangfire's `IBackgroundJobClient` instead and call `_jobs.Enqueue(...)`.
+2. **Humble jobs.** `AssessmentJob.Run(runId)` should only *load → call the calculator → save*. Put the maths in `IntegrityCalculator`, the spreadsheet parsing in `IliRowParser`, and run-to-run matching in `AnomalyMatcher`. All three are plain classes with no dependencies. (And remove the `Task.Delay(60000)` 🙂)
+
+### Test doubles we'll use
+
+| Double | Meszaros definition | In this project |
+|---|---|---|
+| **Dummy** | Passed in but never used | `NullLogger<T>.Instance` |
+| **Stub** | Returns canned answers | `IFileStorage` stub that returns the bytes of a generated `.xlsx` |
+| **Fake** | Works, but takes a shortcut | `InMemoryFileStorage` (a dictionary). SQLite `:memory:` in place of the file database |
+| **Spy** | Records the calls it receives, for checking later | `RecordingJobClient`, which stores what got enqueued |
+| **Mock** | Has expectations and fails the test if they aren't met | `IWebhookSender`: expect exactly one call when a run has ERF ≥ 1 |
+
+Write these by hand at first; they're short. Move to an isolation framework (e.g. NSubstitute) once you know what it's saving you.
+
+### Unit tests
+
+Project `tests/PipelineIntegrity.UnitTests`, using xUnit. No database, files or network, and the whole suite should run in about a second.
+
+**`IntegrityCalculator`** (exit point: return value). Pipe: D = 508 mm, t = 8.7 mm, SMYS = 359 MPa, MAOP = 7 MPa.
+
+| Scenario | d (mm) | L (mm) | Expected |
+|---|---|---|---|
+| No defect = intact pipe | 0 | 100 | failure pressure = 2·(359+69)·8.7/508 ≈ **14.66 MPa** |
+| Short, half-depth defect (z ≤ 50 branch) | 4.35 | 100 | failure pressure ≈ **11.61 MPa**, ERF ≈ **0.84** |
+| Long, half-depth defect (z > 50 branch) | 4.35 | 600 | failure pressure ≈ **9.08 MPa**, ERF ≈ **1.07** → repair |
+| Deeper → weaker | 2 vs 4 | 100 | second failure pressure < first |
+| Invalid input | −1, or > t | any | throws `ArgumentOutOfRangeException` |
+
+> The expected values above come from our own formula, so they only catch *regressions*. Check one case independently (by hand, in a spreadsheet, or against a published B31G worked example) before trusting it. Compare decimals with a tolerance: `Assert.Equal(11.61, p, precision: 2)`.
+
+**`GrowthCalculator`**: 2 mm deeper over 5 years → 0.4 mm/yr. Zero growth → remaining life is `null` ("not limited"), not a divide-by-zero. A defect that measured shallower (measurement noise) → growth is clamped to 0 and flagged.
+
+**`IliRowParser`** (exit point: return value, either a valid anomaly or an error with a row number): a valid row, a missing column, text in a number column, a depth > 100 %, and headers in a different order or case.
+
+**`AnomalyMatcher`**: matches within tolerance, nothing matches just outside tolerance, the nearest defect wins when two are close, a new defect is left unmatched, and the same defect is never matched twice.
+
+**`AssessmentJob`** (exit points: a state change and a third-party call):
+- Using the SQLite `:memory:` fake: after `Run`, every anomaly has a result and the run is `Completed` (state).
+- Using the `IWebhookSender` mock: called once when ERF ≥ 1, never when all ERF < 1 (third-party call, and the only mock in the test).
+- Using a stub storage that throws: the run ends up `Failed` with an error message.
+
+### Integration tests
+
+Project `tests/PipelineIntegrity.IntegrationTests`. These test the real wiring of HTTP, routing, EF Core and serialisation together.
+
+- **Host:** `WebApplicationFactory<Program>`, with these services swapped in `ConfigureTestServices`:
+  - SQLite in-memory database (keep one connection open per test, so the database stays alive)
+  - `InMemoryFileStorage` in place of R2
+  - a job client that **runs jobs immediately**, so a test doesn't have to wait for Hangfire
+- **Fixtures:** a fresh database per test class. Build data with *creation methods* (Meszaros), e.g. `await CreatePipelineAsync()`, so tests don't hand-write setup JSON again and again.
+- **What to cover:**
+  - `POST /pipelines` → `201`; then `GET` returns the same values (round-trip)
+  - Upload `ili_run_1.xlsx` from `generate_ili_data.py --seed 1` → status reaches `completed` → `/digs` is sorted by ERF, highest first
+  - Upload both runs → growth rates are filled in for matched anomalies
+  - A broken file → status `failed`, and `ImportErrors` lists row numbers
+  - Unknown IDs → `404`. Uploading to a pipeline that doesn't exist → `404`, and nothing is stored
+  - Migrations apply cleanly to an empty database
+- **Optional, slower suite:** real Redis and MinIO (an S3-compatible stand-in for R2) via Testcontainers, to test the real `R2FileStorage` adapter and Hangfire. Tag these `[Trait("Category", "Slow")]` and run them separately.
+
+### Test smells to watch for (Meszaros)
+
+| Smell | Looks like | Fix |
+|---|---|---|
+| Obscure test | 40 lines of setup before you find the point | Creation methods, and only set the fields the test cares about |
+| Fragile test | Breaks when you rename a private method | Test through public behaviour (exit points), not internals |
+| Erratic test | Passes alone, fails in the full run | Fresh fixture per test, no shared static state |
+| Slow tests | Unit suite takes minutes | Move it to the integration project, or replace the slow part with a fake |
+| Assertion roulette | 10 asserts, and you can't tell which failed | One concept per test, and give assertions a message where needed |
+| Conditional test logic | `if` or `for` inside a test | Split into separate tests, or use `[Theory]` + `[InlineData]` |
+
+### Running the tests
+
+```bash
+dotnet test tests/PipelineIntegrity.UnitTests          # every change
+dotnet test tests/PipelineIntegrity.IntegrationTests   # before every push
+dotnet test --filter Category=Slow                     # occasionally, needs Docker
+```
+
+**Suggested habit:** for milestone 2, write the `IntegrityCalculator` tests *before* the calculator, and let the table above drive the code.
+
 ## Test data
 
 There's no real pig data to download, so use `tools/generate_ili_data.py` to make some:
