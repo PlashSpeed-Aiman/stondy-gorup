@@ -4,6 +4,8 @@ An ASP.NET Core 8 API that **simulates long-running calculation work**. Rather t
 
 The "calculation" is an Excel-to-GeoJSON conversion: an uploaded `.xlsx` file containing latitude/longitude columns is converted into a GeoJSON `FeatureCollection`. A deliberate one-minute delay stands in for the real heavy computation.
 
+**Next study project:** [ROADMAP.md](ROADMAP.md) turns this into a pipeline integrity API that runs real corrosion-assessment maths inside the same upload → job → poll flow.
+
 ## Request lifecycle
 
 ```mermaid
