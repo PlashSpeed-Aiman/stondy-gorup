@@ -157,7 +157,7 @@ erDiagram
    - `Anomalies (RunId, DistanceM)`: chainage-range queries, and matching between runs
    - `AnomalyResults (AssessmentId, Erf DESC)`: the dig list
    - `IliRuns (PipelineId, InspectionDate)`: "find the previous run"
-6. **Pick key types on purpose.** Use GUIDs for things clients see and share (pipelines, runs). They're safe to expose and work as storage keys, as today. Use auto-increment `long` for the large internal tables (anomalies), because the keys are smaller and inserts are faster.
+6. **Pick key types on purpose.** Use GUIDs for things clients see and share (pipelines, runs). They're safe to expose and work as storage keys, as today. Use auto-increment `long` for the large internal tables (anomalies), because the keys are smaller and inserts are faster. In MySQL, the Pomelo provider stores a `Guid` as `char(36)` by default.
 7. **Record bad rows instead of failing the whole file.** One bad row out of 50,000 goes into `ImportErrors` with its row number. Fail the run only if no rows are valid, or if more than a set threshold are bad.
 8. **Store status as text, not a number.** `"Completed"` is readable when you open the database by hand. In EF Core, use `.HasConversion<string>()`.
 9. **`double` is fine here.** Unlike money, engineering values are already measurements with error. Round only when displaying.
@@ -186,7 +186,7 @@ flowchart LR
 
     R2[("Cloudflare R2<br/>raw spreadsheets")]
     Redis[("Redis<br/>job queue")]
-    DB[("SQLite<br/>pipelines · runs · anomalies")]
+    DB[("MySQL 8<br/>pipelines · runs · anomalies")]
     Hook["Webhook receiver<br/>(e.g. a test endpoint)"]
 
     Client -->|HTTP| Controllers
@@ -217,7 +217,7 @@ sequenceDiagram
     participant C as Client
     participant A as API
     participant S as R2
-    participant D as SQLite
+    participant D as MySQL
     participant Q as Redis (Hangfire)
     participant W as Workers
 
@@ -305,7 +305,7 @@ This plan follows two books:
 ```mermaid
 flowchart TB
     E2E["End-to-end (a few)<br/>upload generated file → poll → dig list"]
-    INT["Integration (some)<br/>real API + real SQLite, fake storage and queue"]
+    INT["Integration (some)<br/>real API + real MySQL (Testcontainers), fake storage and queue"]
     UNIT["Unit (many)<br/>calculator · parser · matcher · job logic"]
     E2E --- INT --- UNIT
 ```
@@ -323,7 +323,7 @@ Tests need **seams**: places where a test can plug in a double. Two seams to add
 |---|---|---|
 | **Dummy** | Passed in but never used | `NullLogger<T>.Instance` |
 | **Stub** | Returns canned answers | `IFileStorage` stub that returns the bytes of a generated `.xlsx` |
-| **Fake** | Works, but takes a shortcut | `InMemoryFileStorage` (a dictionary). SQLite `:memory:` in place of the file database |
+| **Fake** | Works, but takes a shortcut | `InMemoryFileStorage` (a dictionary) in place of R2 |
 | **Spy** | Records the calls it receives, for checking later | `RecordingJobClient`, which stores what got enqueued |
 | **Mock** | Has expectations and fails the test if they aren't met | `IWebhookSender`: expect exactly one call when a run has ERF ≥ 1 |
 
@@ -351,28 +351,51 @@ Project `tests/PipelineIntegrity.UnitTests`, using xUnit. No database, files or 
 
 **`AnomalyMatcher`**: matches within tolerance, nothing matches just outside tolerance, the nearest defect wins when two are close, a new defect is left unmatched, and the same defect is never matched twice.
 
-**`AssessmentJob`** (exit points: a state change and a third-party call):
-- Using the SQLite `:memory:` fake: after `Run`, every anomaly has a result and the run is `Completed` (state).
-- Using the `IWebhookSender` mock: called once when ERF ≥ 1, never when all ERF < 1 (third-party call, and the only mock in the test).
-- Using a stub storage that throws: the run ends up `Failed` with an error message.
+> Jobs read and write the database, so per Osherove they are tested in the **integration** suite (below), against a real database. Unit tests never touch a database.
 
 ### Integration tests
 
-Project `tests/PipelineIntegrity.IntegrationTests`. These test the real wiring of HTTP, routing, EF Core and serialisation together.
+Project `tests/PipelineIntegrity.IntegrationTests`. These test the real wiring of HTTP, routing, EF Core, SQL and serialisation together.
 
+**Why a real database, through Testcontainers?** An in-memory database is a *fake* (in Meszaros's terms): it skips real SQL, constraints, indexes and spatial functions, so tests can pass while production fails. [Testcontainers](https://dotnet.testcontainers.org/) starts a real **MySQL** in Docker for the test run and throws it away afterwards. The study project therefore uses **MySQL 8** in place of SQLite, so tests and production run on the same engine. Testcontainers needs a database *server*, and MySQL's spatial types (`POINT SRID 4326`, `ST_Distance_Sphere`, `MBRContains`) cover the map queries in milestone 3.
+
+- **Packages:**
+  - `Testcontainers.MySql` starts the container
+  - `Pomelo.EntityFrameworkCore.MySql`, plus `Pomelo.EntityFrameworkCore.MySql.NetTopologySuite` for spatial columns, is the EF Core provider
+  - `Respawn` resets the data between tests
+- **Container:** one per test run, because starting it takes a few seconds. Share it with an xUnit collection fixture:
+
+  ```csharp
+  public class MySqlFixture : IAsyncLifetime
+  {
+      public MySqlContainer Db { get; } = new MySqlBuilder()
+          .WithImage("mysql:8.4")
+          .Build();
+
+      public Task InitializeAsync() => Db.StartAsync();       // run migrations once here too
+      public Task DisposeAsync() => Db.DisposeAsync().AsTask();
+  }
+  ```
+
+- **Fresh fixture per test:** the container is shared, but each test starts with empty tables (in each test's `InitializeAsync`, Respawn with `DbAdapter = DbAdapter.MySql` deletes all rows). That keeps tests independent, so none of them become erratic tests.
 - **Host:** `WebApplicationFactory<Program>`, with these services swapped in `ConfigureTestServices`:
-  - SQLite in-memory database (keep one connection open per test, so the database stays alive)
+  - the `ApplicationDbContext` connection string → `fixture.Db.GetConnectionString()`
   - `InMemoryFileStorage` in place of R2
   - a job client that **runs jobs immediately**, so a test doesn't have to wait for Hangfire
-- **Fixtures:** a fresh database per test class. Build data with *creation methods* (Meszaros), e.g. `await CreatePipelineAsync()`, so tests don't hand-write setup JSON again and again.
-- **What to cover:**
+- **Creation methods** (Meszaros), e.g. `await CreatePipelineAsync()`, so tests don't hand-write setup JSON again and again.
+- **`AssessmentJob`** (exit points: a state change and a third-party call). Call `job.Run(runId)` directly, against the container database:
+  - After `Run`, every anomaly has a result and the run is `Completed` (state)
+  - The `IWebhookSender` mock is called once when ERF ≥ 1, and never when every ERF < 1 (third-party call; it's the only mock in the test)
+  - With a stub storage that throws, the run ends up `Failed` with an error message
+- **What to cover over HTTP:**
   - `POST /pipelines` → `201`; then `GET` returns the same values (round-trip)
   - Upload `ili_run_1.xlsx` from `generate_ili_data.py --seed 1` → status reaches `completed` → `/digs` is sorted by ERF, highest first
   - Upload both runs → growth rates are filled in for matched anomalies
   - A broken file → status `failed`, and `ImportErrors` lists row numbers
   - Unknown IDs → `404`. Uploading to a pipeline that doesn't exist → `404`, and nothing is stored
   - Migrations apply cleanly to an empty database
-- **Optional, slower suite:** real Redis and MinIO (an S3-compatible stand-in for R2) via Testcontainers, to test the real `R2FileStorage` adapter and Hangfire. Tag these `[Trait("Category", "Slow")]` and run them separately.
+  - A duplicate or orphan row is rejected by the database, which proves the constraints are real (an in-memory fake could never test this)
+- **Optional, slower suite:** real Redis and MinIO (an S3-compatible stand-in for R2), also via Testcontainers, to test the real `R2FileStorage` adapter and Hangfire. Tag these `[Trait("Category", "Slow")]` and run them separately.
 
 ### Test smells to watch for (Meszaros)
 
@@ -389,11 +412,51 @@ Project `tests/PipelineIntegrity.IntegrationTests`. These test the real wiring o
 
 ```bash
 dotnet test tests/PipelineIntegrity.UnitTests          # every change
-dotnet test tests/PipelineIntegrity.IntegrationTests   # before every push
+dotnet test tests/PipelineIntegrity.IntegrationTests   # before every push, needs Docker (MySQL)
 dotnet test --filter Category=Slow                     # occasionally, needs Docker
 ```
 
 **Suggested habit:** for milestone 2, write the `IntegrityCalculator` tests *before* the calculator, and let the table above drive the code.
+
+### Debugging a failing test
+
+**The test is the entry point.** You don't need to call the API over HTTP or click around in Swagger. The test runner calls your code directly, so you debug the test itself:
+
+1. Put a breakpoint in the **production code** you suspect (e.g. inside `IntegrityCalculator`), not only in the test.
+2. Start the test **under the debugger**:
+   - **Visual Studio:** Test Explorer → right-click the test → *Debug*
+   - **Rider:** click the icon next to the test → *Debug*
+   - **VS Code** (C# Dev Kit): Testing panel → *Debug Test*, or the "Debug Test" link above the method
+   - **Command line:** set `VSTEST_HOST_DEBUG=1` and run `dotnet test --filter "FullyQualifiedName~CalculateErf"`. It prints a process ID and waits, so attach your IDE's debugger to that process.
+3. Step through the code and watch the variables. It behaves exactly as it would when called from a controller.
+
+**Integration tests can be debugged the same way.** `WebApplicationFactory` runs the whole API **inside the test process**. A breakpoint in a controller, in EF Core code, or in a job is hit when the test sends a request. Jobs are hit too, because the test job client runs them immediately instead of queuing them in Redis.
+
+```mermaid
+flowchart LR
+    T["Test method<br/>(debugger attached)"] -->|"client.PostAsync(...)"| C["Controller"]
+    C --> J["Job (runs inline)"]
+    J --> K["IntegrityCalculator"]
+    J --> DB[("MySQL container")]
+    T -.->|"or call directly"| J
+    T -.->|"or call directly"| K
+```
+
+Every box above runs in **one process**, so breakpoints work anywhere along the path.
+
+**Tips for when the cause isn't obvious:**
+
+| Problem | What to do |
+|---|---|
+| "Expected 0.84, actual 1.12" and you don't know why | Use a `[Theory]` with the exact failing inputs, then step through the calculation |
+| Integration test returns `500` with no details | Show the response body in the failure message: `Assert.True(resp.IsSuccessStatusCode, await resp.Content.ReadAsStringAsync())` |
+| You want to see the logs | Inject xUnit's `ITestOutputHelper` and send `ILogger` output to it (e.g. the `MartinCostello.Logging.XUnit` package, `logging.AddXUnit(output)` in `ConfigureTestServices`). Logs then appear next to the failing test |
+| You want to see the SQL EF Core sends | In the test host, add `options.LogTo(output.WriteLine).EnableSensitiveDataLogging()` to the `DbContext` options |
+| You want to look inside the database | Pause at a breakpoint. Log `fixture.Db.GetConnectionString()` (it includes a random port), or run `docker ps` to find it. Connect with MySQL Workbench, DBeaver, or `docker exec -it <container> mysql -uroot -p`. Data stays until the next test resets it |
+| It fails on a 50,000-row file | Make it smaller: `python tools/generate_ili_data.py --count 10 --seed <same>`, then find the one row that causes the failure |
+| It fails in Hangfire for real, not in a test | Open `/hangfire` → *Failed jobs* to see the exception and stack trace. Copy the inputs into a new test that reproduces it, then debug that test |
+
+**After you find the bug** (Osherove): first write the *smallest* unit test that fails because of it. Then fix the code, watch that test turn green, and keep it, so the bug can't come back unnoticed.
 
 ## Test data
 
