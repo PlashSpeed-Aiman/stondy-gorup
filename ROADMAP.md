@@ -71,6 +71,98 @@ remainingLife = (0.8·t − depthNow) / growthRate              // years until 8
 | `GET` | `/pipelines/{id}/anomalies.geojson?bbox=` | Defects as a GeoJSON map layer |
 | `GET` | `/pipelines/{id}/digs` | Repair list, sorted by most urgent |
 
+## Database design
+
+### Tables
+
+```mermaid
+erDiagram
+    Pipelines ||--o{ IliRuns : "inspected by"
+    IliRuns ||--o{ Anomalies : contains
+    IliRuns ||--o{ ImportErrors : "rejected rows"
+    IliRuns ||--o{ Assessments : "assessed by"
+    Assessments ||--o{ AnomalyResults : produces
+    Anomalies ||--o{ AnomalyResults : "result for"
+    Anomalies |o--o{ AnomalyResults : "matched to (previous run)"
+
+    Pipelines {
+        guid Id PK
+        string Name
+        double OuterDiameterMm
+        double WallThicknessMm
+        string Grade
+        double SmysMpa
+        double MaopMpa
+        string RouteGeoJson
+        datetime CreatedAt
+    }
+    IliRuns {
+        guid Id PK "also the R2 file key"
+        guid PipelineId FK
+        date InspectionDate
+        string Status "Importing / Assessing / Completed / Failed"
+        int ProgressPct
+        string Error
+        datetime CreatedAt
+    }
+    Anomalies {
+        long Id PK
+        guid RunId FK
+        int RowNumber
+        string VendorFeatureId
+        double DistanceM
+        double Lat
+        double Lon
+        double DepthPct
+        double LengthMm
+    }
+    ImportErrors {
+        long Id PK
+        guid RunId FK
+        int RowNumber
+        string Message
+    }
+    Assessments {
+        guid Id PK
+        guid RunId FK
+        string Method "ModifiedB31G"
+        double MaopMpaUsed
+        datetime CreatedAt
+    }
+    AnomalyResults {
+        guid AssessmentId PK, FK
+        long AnomalyId PK, FK
+        double FailurePressureMpa
+        double Erf
+        long MatchedAnomalyId FK "nullable"
+        double GrowthMmPerYear "nullable"
+        double RemainingLifeYears "nullable"
+    }
+```
+
+| Milestone | Tables added |
+|---|---|
+| 1 | `Pipelines`, `IliRuns`, `Anomalies`, `ImportErrors` |
+| 2 | `Assessments`, `AnomalyResults` (ERF only) |
+| 4 | The growth columns on `AnomalyResults` |
+| 5 | `AuditLog` (`Id, At, User, Action, EntityId, Details`), append-only |
+
+### Guidelines
+
+1. **Keep inputs and results separate.** `Anomalies` holds exactly what the file said and is never updated. Calculated values go in `AnomalyResults`. If the formula has a bug, or the MAOP changes, you create a new `Assessment` and old results are kept. Overwriting would erase the history that regulators ask for.
+2. **Put the unit in the column name**: `WallThicknessMm`, `MaopMpa`, `DistanceM`. Unit mix-ups (mm vs inches, MPa vs psi) are a classic engineering bug, and a name like `Thickness` hides them.
+3. **Store values that are copied at the time.** `Assessments.MaopMpaUsed` records the MAOP the calculation actually used. If someone edits the pipeline later, the old result still makes sense.
+4. **Use foreign keys everywhere** and let the database enforce them. Deleting a run should cascade to its anomalies, errors and assessments.
+5. **Index what you filter and sort on.** Add each index when an endpoint needs it, and say which query it serves:
+   - `Anomalies (RunId, DistanceM)`: chainage-range queries, and matching between runs
+   - `AnomalyResults (AssessmentId, Erf DESC)`: the dig list
+   - `IliRuns (PipelineId, InspectionDate)`: "find the previous run"
+6. **Pick key types on purpose.** Use GUIDs for things clients see and share (pipelines, runs). They're safe to expose and work as storage keys, as today. Use auto-increment `long` for the large internal tables (anomalies), because the keys are smaller and inserts are faster.
+7. **Record bad rows instead of failing the whole file.** One bad row out of 50,000 goes into `ImportErrors` with its row number. Fail the run only if no rows are valid, or if more than a set threshold are bad.
+8. **Store status as text, not a number.** `"Completed"` is readable when you open the database by hand. In EF Core, use `.HasConversion<string>()`.
+9. **`double` is fine here.** Unlike money, engineering values are already measurements with error. Round only when displaying.
+10. **Insert in batches.** Don't call `SaveChanges()` once per row: 50,000 round trips is slow. Add about 1,000 rows, save, clear the change tracker, and repeat.
+
 ## System architecture
 
 The same building blocks as today's API, with new jobs and a pure calculation module added. Arrows point from the caller to what it depends on.
@@ -186,4 +278,25 @@ Each failure stores an error message, just like `Geometry.Status = Failed` does 
 
 ## Test data
 
-There's no real pig data to download, so write a small script that generates a fake ILI spreadsheet: a straight pipeline route, a few thousand anomalies at random distances, mostly shallow (5–30 %) with a few deep ones (60–80 %). Make a second "run" by growing each depth by 0.1–0.5 mm/year so milestone 4 has something to compare.
+There's no real pig data to download, so use `tools/generate_ili_data.py` to make some:
+
+```bash
+pip install openpyxl
+python tools/generate_ili_data.py                  # 5,000 anomalies, runs 5 years apart
+python tools/generate_ili_data.py --count 50000    # a big file, for testing batching (milestone 2)
+```
+
+It writes three files to `sample-data/` (git-ignored):
+
+| File | Use it for |
+|---|---|
+| `pipeline.json` | The body for `POST /pipelines`: diameter, wall thickness, grade, MAOP, route as a GeoJSON `LineString`, and both inspection dates |
+| `ili_run_1.xlsx` | The first upload. Columns: `feature_id, distance_m, lat, lon, depth_pct, length_mm` |
+| `ili_run_2.xlsx` | The second upload, 5 years later. The same defects are deeper, and there are 5 % new ones |
+
+Things the generator does on purpose, so the exercises are realistic:
+
+- **Most defects are shallow.** 85 % are 5–30 % deep and only about 3 % are 60–80 % deep, so a good dig list is short.
+- **Distances drift between runs**, by roughly ±0.3 m. The same defect never has exactly the same `distance_m` twice, so matching needs a tolerance.
+- **Feature IDs differ between runs** (`A-000123` vs `B-000117`), as they do between real inspection vendors. You can't join on them.
+- **The same `--seed` always gives the same files**, so everyone in the group can compare answers.
