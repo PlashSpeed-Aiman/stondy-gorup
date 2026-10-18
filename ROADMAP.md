@@ -71,6 +71,109 @@ remainingLife = (0.8·t − depthNow) / growthRate              // years until 8
 | `GET` | `/pipelines/{id}/anomalies.geojson?bbox=` | Defects as a GeoJSON map layer |
 | `GET` | `/pipelines/{id}/digs` | Repair list, sorted by most urgent |
 
+## System architecture
+
+The same building blocks as today's API, with new jobs and a pure calculation module added. Arrows point from the caller to what it depends on.
+
+```mermaid
+flowchart LR
+    Client["Client<br/>(curl / Swagger / map UI)"]
+
+    subgraph API["ASP.NET Core API (one process)"]
+        direction TB
+        Controllers["Controllers<br/>Pipelines · Runs · Anomalies"]
+        subgraph Jobs["Hangfire workers"]
+            Import["IliImportJob"]
+            Assess["AssessmentJob"]
+            Growth["GrowthJob"]
+            Alert["AlertJob"]
+        end
+        Calc["Integrity calculator<br/>(pure B31G + growth maths)"]
+        Ports["Ports<br/>IFileStorage · ApplicationDbContext"]
+    end
+
+    R2[("Cloudflare R2<br/>raw spreadsheets")]
+    Redis[("Redis<br/>job queue")]
+    DB[("SQLite<br/>pipelines · runs · anomalies")]
+    Hook["Webhook receiver<br/>(e.g. a test endpoint)"]
+
+    Client -->|HTTP| Controllers
+    Controllers --> Ports
+    Controllers -->|enqueue| Redis
+    Redis -->|dequeue| Jobs
+    Assess --> Calc
+    Growth --> Calc
+    Jobs --> Ports
+    Ports --> R2
+    Ports --> DB
+    Alert -->|POST| Hook
+```
+
+**Rules to keep the design clean:**
+
+- **Controllers stay thin.** They validate the request, save a row, enqueue a job and return. They never do the maths.
+- **The calculator is pure.** No database, no HTTP, no files: numbers in, numbers out. That makes it easy to unit test, and it's the code that has to be right.
+- **Jobs coordinate the work.** They load data through the ports, call the calculator, and save the results.
+- **Each job does one step and then enqueues the next.** If one step fails, you can see where in the Hangfire dashboard.
+
+## Data flow
+
+What happens from upload to results, for one ILI run:
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant A as API
+    participant S as R2
+    participant D as SQLite
+    participant Q as Redis (Hangfire)
+    participant W as Workers
+
+    C->>A: POST /pipelines/{id}/runs (xlsx)
+    A->>S: Store file under new run ID
+    A->>D: Insert IliRun { Status = Importing }
+    A->>Q: Enqueue IliImportJob(runId)
+    A-->>C: 201 { runId, statusUrl }
+
+    Q->>W: IliImportJob
+    W->>S: Read file
+    W->>W: Parse + validate rows
+    W->>D: Insert Anomalies in batches (e.g. 1,000 rows)
+    W->>Q: Enqueue AssessmentJob(runId)
+
+    Q->>W: AssessmentJob
+    W->>D: Load pipeline (D, t, SMYS, MAOP) + anomalies
+    W->>W: B31G → ERF per anomaly
+    W->>D: Save ERF, update progress %
+    W->>Q: Enqueue GrowthJob (if an earlier run exists)
+
+    Q->>W: GrowthJob
+    W->>D: Load previous run's anomalies
+    W->>W: Match by distance ± tolerance → growth rate, remaining life
+    W->>D: Save results, IliRun.Status = Completed
+    W->>Q: Enqueue AlertJob (if any ERF ≥ 1)
+
+    C->>A: GET /runs/{id}/status
+    A-->>C: { status, progress }
+    C->>A: GET /pipelines/{id}/digs
+    A-->>C: Anomalies sorted by urgency
+```
+
+The run's status moves through these states:
+
+```mermaid
+stateDiagram-v2
+    [*] --> Importing
+    Importing --> Assessing: rows saved
+    Assessing --> Completed: ERF + growth saved
+    Importing --> Failed: bad file / no valid rows
+    Assessing --> Failed: calculation error
+    Completed --> [*]
+    Failed --> [*]
+```
+
+Each failure stores an error message, just like `Geometry.Status = Failed` does today.
+
 ## Milestones, and what each one teaches
 
 | # | Build | Backend concept you learn |
