@@ -200,7 +200,7 @@ This builds the API image and starts Redis. Provide the R2 settings to the `weba
 - the endpoints and five milestones, each tied to the backend concept it teaches
 - database design guidelines
 - system architecture and data flow diagrams
-- a unit and integration testing plan (after Meszaros and Osherove), and how to debug failing tests
+- a unit and integration testing plan using MSTest (after Meszaros and Osherove), and how to debug failing tests
 
 Generate sample data for it with:
 

@@ -280,7 +280,7 @@ Each failure stores an error message, just like `Geometry.Status = Failed` does 
 
 This plan follows two books:
 
-- **Gerard Meszaros, *xUnit Test Patterns*:** gives names for the parts of a test, the kinds of test double, and "test smells".
+- **Gerard Meszaros, *xUnit Test Patterns*** ("xUnit" here means the whole family of test frameworks, MSTest included): gives names for the parts of a test, the kinds of test double, and "test smells".
 - **Roy Osherove, *The Art of Unit Testing*:** what a *unit of work* is, how to name tests, stubs vs mocks, and keeping unit and integration tests apart.
 
 ### Key ideas (one line each)
@@ -329,9 +329,50 @@ Tests need **seams**: places where a test can plug in a double. Two seams to add
 
 Write these by hand at first; they're short. Move to an isolation framework (e.g. NSubstitute) once you know what it's saving you.
 
+### Test framework: MSTest
+
+Both test projects use **MSTest**. Create them with `dotnet new mstest -n PipelineIntegrity.UnitTests -o tests/PipelineIntegrity.UnitTests` (and the same for `IntegrationTests`). Cheat sheet:
+
+| You want | MSTest |
+|---|---|
+| A test class / a test | `[TestClass]` / `[TestMethod]` |
+| The same test with several inputs | `[TestMethod]` + one `[DataRow(...)]` per case |
+| Run before or after each test | `[TestInitialize]` / `[TestCleanup]` (may be `async Task`) |
+| Run once per class / once per test assembly | `[ClassInitialize]` / `[AssemblyInitialize]` (static methods) |
+| Compare decimals | `Assert.AreEqual(expected, actual, delta)` |
+| Expect an exception | `Assert.ThrowsException<T>(...)` (`Assert.ThrowsExactly<T>` in newer MSTest versions) |
+| Write output next to a test | a `public TestContext TestContext { get; set; }` property, then `TestContext.WriteLine(...)` |
+| Tag a test | `[TestCategory("Slow")]`, then run with `dotnet test --filter TestCategory=Slow` |
+
+A unit test in that style, with Arrange / Act / Assert and Osherove naming:
+
+```csharp
+[TestClass]
+public class IntegrityCalculatorTests
+{
+    private static readonly Pipe Pipe = new(OuterDiameterMm: 508, WallThicknessMm: 8.7, SmysMpa: 359, MaopMpa: 7);
+
+    [TestMethod]
+    [DataRow(4.35, 100, 0.84, DisplayName = "short defect, z <= 50")]
+    [DataRow(4.35, 600, 1.07, DisplayName = "long defect, z > 50")]
+    public void CalculateErf_HalfDepthDefect_ReturnsExpectedErf(double depthMm, double lengthMm, double expectedErf)
+    {
+        // Arrange: shared pipe above
+
+        // Act
+        var erf = IntegrityCalculator.CalculateErf(Pipe, depthMm, lengthMm);
+
+        // Assert
+        Assert.AreEqual(expectedErf, erf, 0.01);
+    }
+}
+```
+
+`Pipe` and `IntegrityCalculator` are the classes students write in milestone 2. The names are suggestions.
+
 ### Unit tests
 
-Project `tests/PipelineIntegrity.UnitTests`, using xUnit. No database, files or network, and the whole suite should run in about a second.
+Project `tests/PipelineIntegrity.UnitTests` (MSTest). No database, files or network, and the whole suite should run in about a second.
 
 **`IntegrityCalculator`** (exit point: return value). Pipe: D = 508 mm, t = 8.7 mm, SMYS = 359 MPa, MAOP = 7 MPa.
 
@@ -343,7 +384,7 @@ Project `tests/PipelineIntegrity.UnitTests`, using xUnit. No database, files or 
 | Deeper → weaker | 2 vs 4 | 100 | second failure pressure < first |
 | Invalid input | −1, or > t | any | throws `ArgumentOutOfRangeException` |
 
-> The expected values above come from our own formula, so they only catch *regressions*. Check one case independently (by hand, in a spreadsheet, or against a published B31G worked example) before trusting it. Compare decimals with a tolerance: `Assert.Equal(11.61, p, precision: 2)`.
+> The expected values above come from our own formula, so they only catch *regressions*. Check one case independently (by hand, in a spreadsheet, or against a published B31G worked example) before trusting it. Compare decimals with a tolerance: `Assert.AreEqual(11.61, p, 0.01)`.
 
 **`GrowthCalculator`**: 2 mm deeper over 5 years → 0.4 mm/yr. Zero growth → remaining life is `null` ("not limited"), not a divide-by-zero. A defect that measured shallower (measurement noise) → growth is clamped to 0 and flagged.
 
@@ -363,23 +404,27 @@ Project `tests/PipelineIntegrity.IntegrationTests`. These test the real wiring o
   - `Testcontainers.MySql` starts the container
   - `Pomelo.EntityFrameworkCore.MySql`, plus `Pomelo.EntityFrameworkCore.MySql.NetTopologySuite` for spatial columns, is the EF Core provider
   - `Respawn` resets the data between tests
-- **Container:** one per test run, because starting it takes a few seconds. Share it with an xUnit collection fixture:
+- **Container:** one per test run, because starting it takes a few seconds. Start it once for the whole test assembly with MSTest's `[AssemblyInitialize]`:
 
   ```csharp
-  public class MySqlFixture : IAsyncLifetime
+  [TestClass]
+  public class MySqlFixture
   {
-      public MySqlContainer Db { get; } = new MySqlBuilder()
+      public static MySqlContainer Db { get; } = new MySqlBuilder()
           .WithImage("mysql:8.4")
           .Build();
 
-      public Task InitializeAsync() => Db.StartAsync();       // run migrations once here too
-      public Task DisposeAsync() => Db.DisposeAsync().AsTask();
+      [AssemblyInitialize]
+      public static async Task StartAsync(TestContext _) => await Db.StartAsync();   // run migrations once here too
+
+      [AssemblyCleanup]
+      public static async Task StopAsync() => await Db.DisposeAsync();
   }
   ```
 
   The builder API changes between Testcontainers major versions (for example, newer versions may take the image name in the constructor), so check the current docs if this doesn't compile.
 
-- **Fresh fixture per test:** the container is shared, but each test starts with empty tables (in each test's `InitializeAsync`, Respawn with `DbAdapter = DbAdapter.MySql` deletes all rows). That keeps tests independent, so none of them become erratic tests.
+- **Fresh fixture per test:** the container is shared, but each test starts with empty tables (a shared base class has a `[TestInitialize]` method where Respawn, with `DbAdapter = DbAdapter.MySql`, deletes all rows). That keeps tests independent, so none of them become erratic tests. MSTest doesn't run tests in parallel unless you turn it on with `[assembly: Parallelize]`, so leave it off in this project: the tests share one database.
 - **Host:** `WebApplicationFactory<Program>`, with these services swapped in `ConfigureTestServices`:
   - the `ApplicationDbContext` connection string → `fixture.Db.GetConnectionString()`
   - `InMemoryFileStorage` in place of R2
@@ -397,7 +442,7 @@ Project `tests/PipelineIntegrity.IntegrationTests`. These test the real wiring o
   - Unknown IDs → `404`. Uploading to a pipeline that doesn't exist → `404`, and nothing is stored
   - Migrations apply cleanly to an empty database
   - A duplicate or orphan row is rejected by the database, which proves the constraints are real (an in-memory fake could never test this)
-- **Optional, slower suite:** real Redis and MinIO (an S3-compatible stand-in for R2), also via Testcontainers, to test the real `R2FileStorage` adapter and Hangfire. Tag these `[Trait("Category", "Slow")]` and run them separately.
+- **Optional, slower suite:** real Redis and MinIO (an S3-compatible stand-in for R2), also via Testcontainers, to test the real `R2FileStorage` adapter and Hangfire. Tag these `[TestCategory("Slow")]` and run them separately.
 
 ### Test smells to watch for (Meszaros)
 
@@ -408,14 +453,14 @@ Project `tests/PipelineIntegrity.IntegrationTests`. These test the real wiring o
 | Erratic test | Passes alone, fails in the full run | Fresh fixture per test, no shared static state |
 | Slow tests | Unit suite takes minutes | Move it to the integration project, or replace the slow part with a fake |
 | Assertion roulette | 10 asserts, and you can't tell which failed | One concept per test, and give assertions a message where needed |
-| Conditional test logic | `if` or `for` inside a test | Split into separate tests, or use `[Theory]` + `[InlineData]` |
+| Conditional test logic | `if` or `for` inside a test | Split into separate tests, or use `[DataRow]` |
 
 ### Running the tests
 
 ```bash
 dotnet test tests/PipelineIntegrity.UnitTests          # every change
-dotnet test tests/PipelineIntegrity.IntegrationTests   # before every push, needs Docker (MySQL)
-dotnet test --filter Category=Slow                     # occasionally, needs Docker
+dotnet test tests/PipelineIntegrity.IntegrationTests --filter "TestCategory!=Slow"   # before every push, needs Docker (MySQL)
+dotnet test --filter TestCategory=Slow                 # occasionally, needs Docker
 ```
 
 **Suggested habit:** for milestone 2, write the `IntegrityCalculator` tests *before* the calculator, and let the table above drive the code.
@@ -429,7 +474,7 @@ dotnet test --filter Category=Slow                     # occasionally, needs Doc
    - **Visual Studio:** Test Explorer → right-click the test → *Debug*
    - **Rider:** click the icon next to the test → *Debug*
    - **VS Code** (C# Dev Kit): Testing panel → *Debug Test*, or the "Debug Test" link above the method
-   - **Command line:** set `VSTEST_HOST_DEBUG=1` and run `dotnet test --filter "FullyQualifiedName~CalculateErf"`. It prints a process ID and waits, so attach your IDE's debugger to that process.
+   - **Command line:** set `VSTEST_HOST_DEBUG=1` and run `dotnet test --filter "FullyQualifiedName~CalculateErf"`. It prints a process ID and waits, so attach your IDE's debugger to that process. (If the project was set up to use the newer Microsoft.Testing.Platform runner, use `TESTINGPLATFORM_WAIT_ATTACH_DEBUGGER=1` instead.)
 3. Step through the code and watch the variables. It behaves exactly as it would when called from a controller.
 
 **Integration tests can be debugged the same way.** `WebApplicationFactory` runs the whole API **inside the test process**. A breakpoint in a controller, in EF Core code, or in a job is hit when the test sends a request. Jobs are hit too, because the test job client runs them immediately instead of queuing them in Redis.
@@ -450,10 +495,10 @@ Every box above runs in **one process**, so breakpoints work anywhere along the 
 
 | Problem | What to do |
 |---|---|
-| "Expected 0.84, actual 1.12" and you don't know why | Use a `[Theory]` with the exact failing inputs, then step through the calculation |
-| Integration test returns `500` with no details | Show the response body in the failure message: `Assert.True(resp.IsSuccessStatusCode, await resp.Content.ReadAsStringAsync())` |
-| You want to see the logs | Inject xUnit's `ITestOutputHelper` and send `ILogger` output to it (e.g. the `MartinCostello.Logging.XUnit` package, `logging.AddXUnit(output)` in `ConfigureTestServices`). Logs then appear next to the failing test |
-| You want to see the SQL EF Core sends | In the test host, add `options.LogTo(output.WriteLine).EnableSensitiveDataLogging()` to the `DbContext` options |
+| "Expected 0.84, actual 1.12" and you don't know why | Add a `[DataRow]` with the exact failing inputs, then debug just that row |
+| Integration test returns `500` with no details | Show the response body in the failure message: `Assert.IsTrue(resp.IsSuccessStatusCode, await resp.Content.ReadAsStringAsync())` |
+| You want to see the logs | Write a small `ILoggerProvider` (about 20 lines) whose loggers call `TestContext.WriteLine`, and register it in `ConfigureLogging` on the test host. Logs then appear in the test's output, next to the failure |
+| You want to see the SQL EF Core sends | In the test host, add `options.LogTo(TestContext.WriteLine).EnableSensitiveDataLogging()` to the `DbContext` options |
 | You want to look inside the database | Pause at a breakpoint. Log `fixture.Db.GetConnectionString()` (it includes a random port), or run `docker ps` to find it. Connect with MySQL Workbench, DBeaver, or `docker exec -it <container> mysql -uroot -p`. Data stays until the next test resets it |
 | It fails on a 50,000-row file | Make it smaller: `python tools/generate_ili_data.py --count 10 --seed <same>`, then find the one row that causes the failure |
 | It fails in Hangfire for real, not in a test | Open `/hangfire` → *Failed jobs* to see the exception and stack trace. Copy the inputs into a new test that reproduces it, then debug that test |
