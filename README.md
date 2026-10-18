@@ -133,6 +133,9 @@ WebApplication2/
 │   ├── CalculationResultDto.cs
 │   └── Options/R2Options.cs           # configuration shape for R2
 └── Program.cs                         # composition root: DI, Hangfire, EF, Swagger
+tools/
+└── generate_ili_data.py               # fake pipeline inspection data for the study project
+ROADMAP.md                             # the next study project (pipeline integrity API)
 ```
 
 ## Configuration
@@ -188,6 +191,25 @@ This builds the API image and starts Redis. Provide the R2 settings to the `weba
 - EF Core + SQLite — result persistence, migrations
 - AWSSDK.S3 — Cloudflare R2 access
 - ClosedXML — Excel parsing; NetTopologySuite + GeoJSON4STJ — GeoJSON output
+
+## Study roadmap
+
+[ROADMAP.md](ROADMAP.md) is the plan for the study group's next project. It turns this API into a **pipeline integrity** service: upload an in-line inspection spreadsheet, work out how dangerous each corrosion defect is using Modified ASME B31G, compare two inspections to find out how fast defects are growing, and list which ones to repair first. It covers:
+
+- the problem in plain terms, the vocabulary, and the formulas
+- the endpoints and five milestones, each tied to the backend concept it teaches
+- database design guidelines
+- system architecture and data flow diagrams
+- a unit and integration testing plan (after Meszaros and Osherove), and how to debug failing tests
+
+Generate sample data for it with:
+
+```bash
+pip install openpyxl
+python tools/generate_ili_data.py          # writes sample-data/ (git-ignored)
+```
+
+> The roadmap plans a move from SQLite to **MySQL 8**, so integration tests can run against a real database with Testcontainers. The current code described above still uses SQLite.
 
 ## Suggested improvements
 

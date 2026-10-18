@@ -45,7 +45,7 @@ M          = z <= 50 ? sqrt(1 + 0.6275·z − 0.003375·z²)
                      : 0.032·z + 3.3                // "bulging factor"
 failStress = flowStress · (1 − 0.85·d/t) / (1 − 0.85·(d/t) / M)
 failPressure = 2 · failStress · t / D              // pressure that bursts the pipe
-safePressure = failPressure · 0.72                  // safety factor
+safePressure = failPressure · 0.72                  // design factor (0.72 = Class 1 location; simplified)
 ERF          = MAOP / safePressure                  // ≥ 1 → repair
 ```
 
@@ -288,7 +288,7 @@ This plan follows two books:
 | Idea | From | What it means for us |
 |---|---|---|
 | **SUT** (system under test) | Meszaros | The one thing a test is about. Everything else is setup. |
-| **Four-phase test**: setup → exercise → verify → teardown | Meszaros | Write it as **Arrange / Act / Assert** blocks (Osherove's name for the same thing). Teardown is usually automatic. |
+| **Four-phase test**: setup → exercise → verify → teardown | Meszaros | Write it as **Arrange / Act / Assert** blocks (the same idea under Bill Wake's widely used name, which Osherove uses too). Teardown is usually automatic. |
 | **Unit of work** | Osherove | A unit is not "one method". It's everything that runs from one entry point to one *exit point*. |
 | **Three exit points**: a return value, a state change, or a call to a third party | Osherove | Check return values and state directly. Only a call to a third party needs a mock. |
 | **Test doubles**: dummy, stub, spy, mock, fake | Meszaros | See the table below. Use the precise name, not just "mock". |
@@ -357,7 +357,7 @@ Project `tests/PipelineIntegrity.UnitTests`, using xUnit. No database, files or 
 
 Project `tests/PipelineIntegrity.IntegrationTests`. These test the real wiring of HTTP, routing, EF Core, SQL and serialisation together.
 
-**Why a real database, through Testcontainers?** An in-memory database is a *fake* (in Meszaros's terms): it skips real SQL, constraints, indexes and spatial functions, so tests can pass while production fails. [Testcontainers](https://dotnet.testcontainers.org/) starts a real **MySQL** in Docker for the test run and throws it away afterwards. The study project therefore uses **MySQL 8** in place of SQLite, so tests and production run on the same engine. Testcontainers needs a database *server*, and MySQL's spatial types (`POINT SRID 4326`, `ST_Distance_Sphere`, `MBRContains`) cover the map queries in milestone 3.
+**Why a real database, through Testcontainers?** An in-memory database is a *fake* (in Meszaros's terms): it skips real SQL, constraints, indexes and spatial functions, so tests can pass while production fails. [Testcontainers](https://dotnet.testcontainers.org/) starts a real **MySQL** in Docker for the test run and throws it away afterwards. The study project therefore uses **MySQL 8** in place of SQLite, so tests and production run on the same engine. Testcontainers needs a database *server*, and MySQL's spatial types (`POINT SRID 4326`, `ST_Distance_Sphere`, `MBRContains`) cover the map queries in milestone 3. Watch out: with SRID 4326, MySQL expects coordinates in **latitude, longitude** order, but GeoJSON uses longitude, latitude.
 
 - **Packages:**
   - `Testcontainers.MySql` starts the container
@@ -376,6 +376,8 @@ Project `tests/PipelineIntegrity.IntegrationTests`. These test the real wiring o
       public Task DisposeAsync() => Db.DisposeAsync().AsTask();
   }
   ```
+
+  The builder API changes between Testcontainers major versions (for example, newer versions may take the image name in the constructor), so check the current docs if this doesn't compile.
 
 - **Fresh fixture per test:** the container is shared, but each test starts with empty tables (in each test's `InitializeAsync`, Respawn with `DbAdapter = DbAdapter.MySql` deletes all rows). That keeps tests independent, so none of them become erratic tests.
 - **Host:** `WebApplicationFactory<Program>`, with these services swapped in `ConfigureTestServices`:
@@ -479,6 +481,6 @@ It writes three files to `sample-data/` (git-ignored):
 Things the generator does on purpose, so the exercises are realistic:
 
 - **Most defects are shallow.** 85 % are 5–30 % deep and only about 3 % are 60–80 % deep, so a good dig list is short.
-- **Distances drift between runs**, by roughly ±0.3 m. The same defect never has exactly the same `distance_m` twice, so matching needs a tolerance.
+- **Distances drift between runs**, by roughly ±0.3 m. The same defect never has exactly the same `distance_m` twice, so matching needs a tolerance. (This is simplified: real odometer error is usually larger, and real tools first line both runs up on the girth welds between pipe joints, which this data doesn't include.)
 - **Feature IDs differ between runs** (`A-000123` vs `B-000117`), as they do between real inspection vendors. You can't join on them.
 - **The same `--seed` always gives the same files**, so everyone in the group can compare answers.
