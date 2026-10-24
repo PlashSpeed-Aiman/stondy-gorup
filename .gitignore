@@ -18,3 +18,6 @@ appsettings.*.local.json
 
 # Generated study data (tools/generate_ili_data.py)
 sample-data/
+
+# Uploaded run files (LocalFileStorage)
+storage/

@@ -10,7 +10,7 @@ public class CreatePipelineDto
 
     public double WallThicknessMm { get; set; }
 
-    public string Grade { get; set; } = string.Empty;
+    public string? Grade { get; set; } = string.Empty;
 
     public double SmysMpa { get; set; }
 
