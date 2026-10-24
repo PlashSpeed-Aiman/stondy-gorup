@@ -124,30 +124,39 @@ public class AnomaliesController : ControllerBase
         return Ok(result);
     }
 
-    // ------------------------------------------------------------------------
-    // GET /pipelines/{pipelineId}/anomalies.geojson
-    // ------------------------------------------------------------------------
-    // The map-layer endpoint. It returns a GeoJSON FeatureCollection:
-    //
-    //   {
-    //     "type": "FeatureCollection",
-    //     "features": [
-    //       {
-    //         "type": "Feature",
-    //         "geometry": { "type": "Point", "coordinates": [lon, lat] },
-    //         "properties": { ...the anomaly fields... }
-    //       }
-    //     ]
-    //   }
-    //
-    // Each anomaly becomes one Point feature. The geometry is what the map draws;
-    // the properties are what it shows in a popup or uses to colour the point
-    // (for example, red when ERF >= 1).
-    //
-    // The bbox parameter restricts the query to the visible map rectangle:
-    //   ?bbox=minLon,minLat,maxLon,maxLat
-    // Omitting bbox returns the whole pipeline (up to GeoJsonLimit features).
-    // ------------------------------------------------------------------------
+
+    /// <summary>
+    /// ------------------------------------------------------------------------
+    /// <br/>
+    /// GET /pipelines/{pipelineId}/anomalies.geojson
+    /// ------------------------------------------------------------------------
+    /// <br/>
+    /// The map-layer endpoint. It returns a GeoJSON FeatureCollection:
+    /// <code>
+    ///   {
+    ///     "type": "FeatureCollection",
+    ///     "features": [
+    ///       {
+    ///         "type": "Feature",
+    ///         "geometry": { "type": "Point", "coordinates": [lon, lat] },
+    ///         "properties": { ...the anomaly fields... }
+    ///       }
+    ///     ]
+    ///   }
+    /// </code>
+    ///<br/>
+    /// Each anomaly becomes one Point feature. The geometry is what the map draws;
+    /// the properties are what it shows in a popup or uses to colour the point
+    /// (for example, red when ERF >= 1).
+    /// <br/>
+    /// ------------------------------------------------------------------------
+    /// <br/>
+    /// The bbox parameter restricts the query to the visible map rectangle:
+    ///   ?bbox=minLon,minLat,maxLon,maxLat
+    /// Omitting bbox returns the whole pipeline (up to GeoJsonLimit features).
+    /// <br/>
+    /// ------------------------------------------------------------------------
+    /// </summary>
     [HttpGet("anomalies.geojson")]
     public async Task<IActionResult> GetAnomaliesGeoJson(
         string pipelineId,
