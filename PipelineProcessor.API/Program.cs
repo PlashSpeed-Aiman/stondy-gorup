@@ -66,11 +66,15 @@ public class Program
         // --------------------------------------------------------------------
         // Step 4: register application services.
         // --------------------------------------------------------------------
-        // Scoped services live for one request/job. AnomalyQueryService uses the
-        // scoped DbContext, so it must be scoped as well. IliImportJob is
-        // resolved by Quartz inside a per-job DI scope.
+        // Scoped services live for one request/job. The query service and the
+        // run-state service use the scoped DbContext, so they must be scoped as
+        // well. The two jobs are resolved by Quartz inside a per-job DI scope:
+        // IliImportJob saves the spreadsheet rows, then AssessmentJob calculates
+        // ERF with the pure IntegrityCalculator.
         builder.Services.AddScoped<AnomalyQueryService>();
+        builder.Services.AddScoped<IliRunStateService>();
         builder.Services.AddScoped<IliImportJob>();
+        builder.Services.AddScoped<AssessmentJob>();
 
         // This is the Dependency Inversion seam for background jobs:
         //   controller -> IJobScheduler -> QuartzJobScheduler -> Quartz.

@@ -23,13 +23,14 @@ namespace PipelineProcessor.Jobs;
 //          -> IliRowParser.Parse (pure: bytes in, rows out)
 //          -> save valid rows in batches of 1,000
 //          -> save rejected rows to ImportErrors
-//          -> set the run to Completed or Failed
+//          -> set the run to Assessing
+//          -> enqueue AssessmentJob to calculate ERF
 //
 // The client polls GET /runs/{runId}/status while this happens.
 //
-// This job deliberately does NOT calculate ERF or corrosion growth. Those
-// calculations belong to the later assessment job, which keeps the maths in a
-// pure, easily testable class instead of inside infrastructure code.
+// This job deliberately does NOT calculate ERF. That maths belongs to
+// AssessmentJob and IntegrityCalculator, which keeps it pure and testable
+// instead of mixing it into spreadsheet and database code.
 // ============================================================================
 
 /// <summary>
@@ -50,23 +51,30 @@ public sealed class IliImportJob : IJob
     private const double MaxErrorRatio = 0.10;
 
     // These dependencies are injected by Quartz's dependency-injection job
-    // factory. The job never creates a DbContext or storage adapter itself.
+    // factory. The job never creates a DbContext, storage adapter or scheduler
+    // itself.
     private readonly PipelineDbContext _dbContext;
     private readonly IFileStorage _fileStorage;
+    private readonly IJobScheduler _jobScheduler;
+    private readonly IliRunStateService _runState;
     private readonly ILogger<IliImportJob> _logger;
 
     /// <summary>
-    /// Constructor injection: the database, file storage and logger are all
-    /// supplied from outside. This is also what makes the job testable: a test
-    /// can pass an in-memory database and a fake storage implementation.
+    /// Constructor injection: every dependency is supplied from outside. This
+    /// is also what makes the job testable: a test can pass an in-memory
+    /// database, a fake storage implementation and a recording job scheduler.
     /// </summary>
     public IliImportJob(
         PipelineDbContext dbContext,
         IFileStorage fileStorage,
+        IJobScheduler jobScheduler,
+        IliRunStateService runState,
         ILogger<IliImportJob> logger)
     {
         _dbContext = dbContext;
         _fileStorage = fileStorage;
+        _jobScheduler = jobScheduler;
+        _runState = runState;
         _logger = logger;
     }
 
@@ -140,7 +148,7 @@ public sealed class IliImportJob : IJob
             // status endpoint.
             if (parseResult.FatalError is not null)
             {
-                await MarkFailedAsync(runId, parseResult.FatalError, cancellationToken);
+                await _runState.MarkFailedAsync(runId, parseResult.FatalError, cancellationToken);
                 return;
             }
 
@@ -162,7 +170,7 @@ public sealed class IliImportJob : IJob
                     ? "No valid rows were found in the file."
                     : $"More than {MaxErrorRatio:P0} of the rows were invalid.";
 
-                await MarkFailedAsync(runId, message, cancellationToken);
+                await _runState.MarkFailedAsync(runId, message, cancellationToken);
                 return;
             }
 
@@ -173,18 +181,44 @@ public sealed class IliImportJob : IJob
             // a small number of bad rows is normal in vendor spreadsheets.
             await SaveImportErrorsAsync(runId, parseResult.Errors, cancellationToken);
 
-            // 3h. The import succeeded. Set progress to 100 and clear any old
-            // error message. This is the state the polling client waits for.
-            await SetRunStateAsync(
+            // 3h. The import worked, but the run is not finished yet. ERF has
+            // not been calculated, so move to Assessing and leave progress at
+            // 90%. AssessmentJob will take it to 100 and then Completed.
+            await _runState.SetStateAsync(
                 runId,
-                IliRunStatus.Completed,
-                progressPct: 100,
+                IliRunStatus.Assessing,
+                progressPct: 90,
                 error: null,
                 cancellationToken);
 
-            // 3i. Write a structured summary to the application log.
+            // 3i. Hand the next step to a separate job. This is the same
+            // IJobScheduler port the controller uses: the import job does not
+            // know that Quartz is underneath.
+            try
+            {
+                await _jobScheduler.EnqueueAsync<AssessmentJob>(
+                    new JobDataMap { ["runId"] = runId },
+                    cancellationToken);
+            }
+            catch (Exception exception)
+            {
+                // Without this job the run would sit in Assessing forever.
+                _logger.LogError(
+                    exception,
+                    "Could not enqueue the assessment job for run {RunId}.",
+                    runId);
+
+                await _runState.MarkFailedAsync(
+                    runId,
+                    "The assessment job could not be enqueued.",
+                    CancellationToken.None);
+
+                return;
+            }
+
+            // 3j. Write a structured summary to the application log.
             _logger.LogInformation(
-                "Imported {AnomalyCount} anomalies with {ErrorCount} rejected rows for run {RunId}.",
+                "Imported {AnomalyCount} anomalies with {ErrorCount} rejected rows for run {RunId}; assessment enqueued.",
                 parseResult.Anomalies.Count,
                 parseResult.Errors.Count,
                 runId);
@@ -201,7 +235,7 @@ public sealed class IliImportJob : IJob
             // want the database update to be attempted.
             try
             {
-                await MarkFailedAsync(runId, exception.Message, CancellationToken.None);
+                await _runState.MarkFailedAsync(runId, exception.Message, CancellationToken.None);
             }
             catch (Exception updateException)
             {
@@ -304,12 +338,11 @@ public sealed class IliImportJob : IJob
         int total,
         CancellationToken cancellationToken)
     {
-        // Progress is scaled to 90%, not 100%. The last 10% is reserved for
-        // saving rejected rows and writing the final Completed status, so the
-        // client never sees "100%" while work is still happening.
-        var progress = total == 0 ? 100 : (int)Math.Round(saved / (double)total * 90);
+        // Import progress stops at 90%. The final 10% belongs to AssessmentJob,
+        // so the client never sees 100% while ERF is still being calculated.
+        var progress = total == 0 ? 90 : (int)Math.Round(saved / (double)total * 90);
 
-        await SetRunStateAsync(
+        await _runState.SetStateAsync(
             runId,
             IliRunStatus.Importing,
             progress,
@@ -343,57 +376,5 @@ public sealed class IliImportJob : IJob
             // Same reasoning as SaveBatchAsync: detach the saved entities.
             _dbContext.ChangeTracker.Clear();
         }
-    }
-
-    /// <summary>
-    /// Convenience wrapper for marking a run as failed.
-    /// </summary>
-    private Task MarkFailedAsync(
-        string runId,
-        string error,
-        CancellationToken cancellationToken)
-    {
-        // progressPct is null, so the progress value already stored is kept.
-        // Only the status and the error message change.
-        return SetRunStateAsync(runId, IliRunStatus.Failed, progressPct: null, error, cancellationToken);
-    }
-
-    /// <summary>
-    /// The single place that changes a run's status, progress and error text.
-    /// </summary>
-    private async Task SetRunStateAsync(
-        string runId,
-        string status,
-        int? progressPct,
-        string? error,
-        CancellationToken cancellationToken)
-    {
-        // The run is fetched again on every call because ChangeTracker.Clear()
-        // has detached any previously loaded copy. The database is the source
-        // of truth between batches.
-        var run = await _dbContext.IliRuns
-            .FirstOrDefaultAsync(candidate => candidate.Id == runId, cancellationToken);
-
-        // The run may have been deleted while the job was running. In that
-        // case there is nothing to update, and no reason to crash.
-        if (run is null)
-        {
-            return;
-        }
-
-        run.Status = status;
-        run.Error = error;
-
-        // Progress is optional. Passing null means "leave the current value
-        // alone", which is what a failure wants to do.
-        if (progressPct.HasValue)
-        {
-            run.ProgressPct = progressPct.Value;
-        }
-
-        await _dbContext.SaveChangesAsync(cancellationToken);
-
-        // Detach the run as well. The next call will load a fresh copy.
-        _dbContext.ChangeTracker.Clear();
     }
 }

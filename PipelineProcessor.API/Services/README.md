@@ -1,6 +1,8 @@
 # Services: SRP and Dependency Inversion
 
-This folder contains the application's **ports**, **adapters**, and **pure helpers**:
+This folder contains the application's **ports**, **adapters**, and **pure helpers**.
+For the overall reading order and the other patterns in the project, see the
+[project student guide](../../README.md).
 
 ```text
 Services/
@@ -10,6 +12,8 @@ Services/
 ├── IJobScheduler.cs       port   - contract for enqueuing background jobs
 ├── QuartzJobScheduler.cs  adapter - implements the port with Quartz.NET
 ├── IliRowParser.cs        pure helper - spreadsheet bytes -> rows + errors
+├── IntegrityCalculator.cs pure helper - Modified ASME B31G ERF maths
+├── IliRunStateService.cs  application service - run status/progress updates
 └── AnomalyQueryService.cs application service - read-side anomaly queries
 ```
 
@@ -33,6 +37,8 @@ unrelated classes.
 | `IJobScheduler` | Define what the application needs from a job scheduler. | The job-enqueueing contract changes. |
 | `QuartzJobScheduler` | Translate the port into Quartz job and trigger objects. | Quartz configuration or scheduling policy changes. |
 | `IliRowParser` | Turn spreadsheet bytes into validated rows and row errors. | The vendor file format or validation rules change. |
+| `IntegrityCalculator` | Apply the Modified ASME B31G formula to pipe and defect numbers. | The engineering formula or design factor changes. |
+| `IliRunStateService` | Own status, progress and error updates for an ILI run. | The workflow states or progress rules change. |
 | `AnomalyQueryService` | Own the read-side rules for anomalies, digs, and GeoJSON. | "Latest run", filtering, paging, or sorting rules change. |
 
 ### 1.1 Storage is separate from scheduling
@@ -66,14 +72,32 @@ That makes it a pure function, which is the easiest kind of code to unit test.
 `IliImportJob` is responsible for the workflow around the parser:
 
 ```text
-read file -> call parser -> save anomalies -> save errors -> update run status
+read file -> call parser -> save anomalies -> save errors
+          -> set run to Assessing -> enqueue AssessmentJob
 ```
 
 The job does not contain the column names or validation rules; the parser does.
 The parser does not know about `IliRun` or `Anomaly` entities; the job maps the
 parser's records to entities.
 
-### 1.3 Read queries are separate from controllers
+### 1.3 Calculation is separate from the job
+
+`AssessmentJob` coordinates the calculation, but does not contain the maths:
+
+```text
+load pipeline + anomalies -> IntegrityCalculator -> save AnomalyResults
+                          -> update run status
+```
+
+`IntegrityCalculator` is a pure static class: numbers in, numbers out, with no
+database, HTTP, file system or clock. That makes the B31G formula easy to unit
+test and keeps a mistake in the engineering formula out of the job workflow.
+The job only converts `depth_pct` to millimetres and persists the result.
+
+`IliRunStateService` is the one place that writes `Status`, `ProgressPct` and
+`Error`. Both jobs use it, so the transition rules are not duplicated.
+
+### 1.4 Read queries are separate from controllers
 
 Three endpoints need the same rule: "use the latest completed run and its latest
 assessment". If that rule lived in each action, it would be copied three times
@@ -92,7 +116,7 @@ GetForGeoJsonAsync          -> bounding-box query for the map
 The controller only translates HTTP input into calls and results into HTTP
 responses.
 
-### 1.4 What stays outside this folder
+### 1.5 What stays outside this folder
 
 SRP also means knowing what does **not** belong here:
 
@@ -101,7 +125,8 @@ SRP also means knowing what does **not** belong here:
 | `RunsController` | HTTP request/response handling and orchestration. |
 | `AnomaliesController` | HTTP routing, query parameters, and GeoJSON response shaping. |
 | `PipelinesController` | HTTP handling for pipeline registration and lookup. |
-| `IliImportJob` | Coordinate the import steps; call the parser and the database. |
+| `IliImportJob` | Coordinate the import steps; call the parser, save rows, enqueue assessment. |
+| `AssessmentJob` | Coordinate assessment; load data, call the calculator, save results. |
 | `Program.cs` | Composition root: choose and wire concrete implementations. |
 
 This is why the controller is called **thin**. It does not parse spreadsheets,
@@ -129,7 +154,9 @@ The important direction is the **source-code dependency**, not the runtime call:
 
         IliImportJob    ───────────────►  IFileStorage
         IliImportJob    ───────────────►  IliRowParser
-        IliImportJob    ───────────────►  PipelineDbContext
+        IliImportJob    ───────────────►  IJobScheduler
+        AssessmentJob   ───────────────►  IntegrityCalculator
+        AssessmentJob   ───────────────►  PipelineDbContext
 ```
 
 - `RunsController` mentions `IFileStorage` and `IJobScheduler`, **not**
@@ -162,6 +189,8 @@ public RunsController(
 public IliImportJob(
     PipelineDbContext dbContext,
     IFileStorage fileStorage,
+    IJobScheduler jobScheduler,
+    IliRunStateService runState,
     ILogger<IliImportJob> logger)
 ```
 
@@ -228,7 +257,10 @@ Inversion** at the infrastructure seams:
 | `IFileStorage` | Singleton | The storage adapter is stateless and can be shared. |
 | `IJobScheduler` | Scoped | It resolves the shared Quartz scheduler per operation. |
 | `IliImportJob` | Scoped | Quartz creates a DI scope for each job execution. |
+| `AssessmentJob` | Scoped | It uses the scoped `PipelineDbContext` and state service. |
+| `IliRunStateService` | Scoped | It uses the scoped `PipelineDbContext`. |
 | `AnomalyQueryService` | Scoped | It uses the scoped `PipelineDbContext`. |
+| `IntegrityCalculator` | Static | It has no dependencies or state, so no container registration is needed. |
 
 ### 2.6 What this buys us
 
@@ -238,8 +270,8 @@ Inversion** at the infrastructure seams:
   - an `InMemoryFileStorage` dictionary instead of R2,
   - a `RecordingJobScheduler` spy that records enqueued jobs,
   - an in-memory EF Core database instead of MySQL.
-- **A pure calculation/parsing core.** `IliRowParser` needs no test doubles at
-  all.
+- **A pure calculation/parsing core.** `IliRowParser` and `IntegrityCalculator`
+  need no test doubles at all.
 - **Fewer surprises.** A controller cannot accidentally open an unmanaged
   `AmazonS3Client` or hard-code a database connection.
 
@@ -268,7 +300,14 @@ RunsController                          (HTTP policy)
         IliImportJob                    (import workflow)
           ├─ IFileStorage.ReadAsync     (port)
           ├─ IliRowParser.Parse         (pure logic)
-          └─ PipelineDbContext          (save Anomalies / ImportErrors)
+          ├─ PipelineDbContext          (save Anomalies / ImportErrors)
+          └─ IJobScheduler.EnqueueAsync (hand off to assessment)
+                 │
+                 ▼
+        AssessmentJob                   (assessment workflow)
+          ├─ PipelineDbContext          (load pipeline + anomalies)
+          ├─ IntegrityCalculator        (pure B31G maths)
+          └─ PipelineDbContext          (save AnomalyResults)
 ```
 
 Each box has one main reason to change. Infrastructure details sit behind ports.
@@ -282,6 +321,7 @@ Each box has one main reason to change. Infrastructure details sit behind ports.
 | Move uploads from local disk to R2 | `Program.cs` configuration | `RunsController`, `IliImportJob` |
 | Replace Quartz with another scheduler | New `IJobScheduler` adapter, `Program.cs` | `RunsController`, `IliImportJob` |
 | Add a new spreadsheet column | `IliRowParser`, its tests | Controllers, storage adapters |
+| Change the B31G formula or design factor | `IntegrityCalculator`, its tests | Jobs, controllers, database |
 | Change the "latest run" rule | `AnomalyQueryService` | Controllers, storage adapters |
 | Change the dig-list sort order | `AnomalyQueryService` | Parser, storage adapters |
 | Change the HTTP status code for validation | `PipelinesController` / `RunsController` | Parser, storage, scheduler |
