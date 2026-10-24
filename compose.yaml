@@ -10,3 +10,20 @@
     container_name: redis
     ports:
       - "6379:6379"
+    
+  mysql:
+    image: mysql:latest
+    container_name: pipeline-mysql
+    environment:
+      MYSQL_DATABASE: pipeline
+      MYSQL_USER: pipeline
+      MYSQL_PASSWORD: root
+      MYSQL_ROOT_PASSWORD: root
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql 
+
+volumes:
+  mysql_data:
+    
