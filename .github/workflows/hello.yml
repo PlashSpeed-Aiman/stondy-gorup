@@ -25,7 +25,6 @@ jobs:
         
   docker-image:
     runs-on: ubuntu-latest
-    
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -44,3 +43,18 @@ jobs:
           file: ./PipelineProcessor.API/Dockerfile
           push: true
           tags: ghcr.io/plashspeed-aiman/stondy-gorup:latest
+  deploy:
+    runs-on: ubuntu-latest
+    needs: docker-image
+    steps:
+      - name: Deploy to Digital Ocean
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.DIGITAL_OCEAN_HOST }}
+          username: ${{ secrets.DIGITAL_OCEAN_USERNAME }}
+          key: ${{ secrets.DIGITAL_OCEAN_KEY }}
+          script: |
+            cd docker/aiman
+            docker compose pull pipeline-api
+            docker compose up pipeline-api -d
+            
