@@ -194,7 +194,12 @@ public class RunsController : ControllerBase
                 StatusUrl = statusUrl
             });
     }
-
+    [HttpGet("/test")]
+    public IActionResult TestEndpoint()
+    {
+        return Ok("Hello");
+    }
+    
     /// <summary>
     /// Polling endpoint: tells the client whether the import is still running,
     /// finished, or failed.
