@@ -139,11 +139,10 @@ public class Program
         // --------------------------------------------------------------------
         // Middleware runs in the order it is added. Swagger is enabled only in
         // Development so the API documentation is not exposed in production.
-        if (app.Environment.IsDevelopment())
-        {
-            app.UseSwagger();
-            app.UseSwaggerUI();
-        }
+        
+        app.UseSwagger();
+        app.UseSwaggerUI();
+        
 
         // Redirect plain HTTP requests to HTTPS.
         app.UseHttpsRedirection();
