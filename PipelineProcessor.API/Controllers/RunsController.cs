@@ -194,7 +194,7 @@ public class RunsController : ControllerBase
                 StatusUrl = statusUrl
             });
     }
-    [HttpGet("/test")]
+    [HttpGet("/MakKau")]
     public IActionResult TestEndpoint()
     {
         return Ok("Hello");
