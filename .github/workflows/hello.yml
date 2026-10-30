@@ -41,6 +41,6 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ./WebApplication2/Dockerfile
+          file: ./PipelineProcessor.API/Dockerfile
           push: true
           tags: ghcr.io/${{ github.repository }}:latest
