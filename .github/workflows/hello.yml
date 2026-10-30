@@ -1,4 +1,4 @@
-name: Wassup World
+name: Build Image
 
 # Triggers
 on:
@@ -43,4 +43,4 @@ jobs:
           context: .
           file: ./PipelineProcessor.API/Dockerfile
           push: true
-          tags: ghcr.io/plashSpeed-aiman/stondy-gorup:latest
+          tags: ghcr.io/plashspeed-aiman/stondy-gorup:latest
